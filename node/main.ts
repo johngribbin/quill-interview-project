@@ -67,12 +67,21 @@ type FromEntry = AstNode & {
   as?: string | null;
   join?: string;
   on?: unknown;
+  using?: unknown;
   expr?: AstNode;
+};
+
+type WithItem = {
+  name: { value: string };
+  stmt: { ast: AstNode };
+  /** Present and true only for WITH RECURSIVE. */
+  recursive?: boolean;
+  columns?: unknown;
 };
 
 type SelectNode = AstNode & {
   type: "select";
-  with?: Array<{ name: { value: string }; stmt: { ast: AstNode } }> | null;
+  with?: WithItem[] | null;
   from?: FromEntry[] | null;
   _next?: AstNode | null;
 };
@@ -87,7 +96,35 @@ type TableInfo = {
 /** Case-insensitive lookup, matching SQLite identifier semantics. */
 type SchemaIndex = Map<string, TableInfo>;
 
-const fold = (identifier: string): string => identifier.toLowerCase();
+/**
+ * SQLite folds identifiers case-insensitively for ASCII only; a non-ASCII
+ * "Üsers" does not match "üsers" (verified: "no such table"). JavaScript's
+ * toLowerCase folds Unicode, which would treat names SQLite considers
+ * distinct as equal — so fold ASCII only, exactly like the engine.
+ */
+const fold = (identifier: string): string =>
+  identifier.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+/**
+ * node-sql-parser misparses NATURAL/CROSS joins, putting the keyword into the
+ * alias slot (`users NATURAL JOIN projects` → `users AS "NATURAL"` + a join
+ * with no constraint). Rejecting these aliases fails closed on that misparse
+ * without inspecting raw query text. SQLite accepts keywords as aliases, so
+ * this is stricter than the engine — deliberately.
+ */
+const JOIN_KEYWORDS = new Set(
+  ["natural", "cross", "outer", "full", "left", "right", "inner", "using", "on"].map(fold),
+);
+
+/**
+ * Every key node-sql-parser is known to place on a FROM entry. Anything else
+ * is a shape the rewriter was not designed for: reject rather than pass it
+ * through silently.
+ */
+const FROM_ENTRY_KEYS = new Set(["db", "table", "as", "join", "on", "using", "expr"]);
+
+/** The only database qualifier the single-database schema can vouch for. */
+const MAIN_DATABASE = "main";
 
 function isSelect(node: unknown): node is SelectNode {
   return (
@@ -200,12 +237,13 @@ function scopedTableReference(
     for_update: null,
   };
 
-  const replacement: FromEntry = {
-    expr: { ast: inner, parentheses: true },
-    as: alias,
-  };
-  if (entry.join !== undefined) replacement.join = entry.join;
-  if (entry.on !== undefined) replacement.on = entry.on;
+  // Carry the entire original entry (join, on, using, and anything the parser
+  // adds later) — only the table reference itself is replaced.
+  const replacement: FromEntry = { ...entry };
+  delete replacement.db;
+  delete replacement.table;
+  replacement.expr = { ast: inner, parentheses: true };
+  replacement.as = alias;
   return replacement;
 }
 
@@ -230,10 +268,21 @@ class Scoper {
         if (typeof name !== "string") {
           throw new TenantScopeError("unsupported CTE shape");
         }
-        // SQLite treats a self-reference as recursive even without RECURSIVE,
-        // so the name is in scope inside its own body.
-        ctes.add(fold(name));
-        this.walk(cte.stmt, ctes);
+        if (cte.recursive === true) {
+          // WITH RECURSIVE: the name is in scope inside its own body
+          // (SQLite documents the self-reference as the defining property
+          // of a recursive CTE), so scope the body with it visible.
+          ctes.add(fold(name));
+          this.walk(cte.stmt, ctes);
+        } else {
+          // Ordinary CTE: SQLite resolves a self-reference inside the body
+          // to the CTE itself and then fails with "circular reference: <name>".
+          // Scope the body WITHOUT the name in scope: a self-reference then
+          // resolves to the base table (and is scoped) or is rejected. Either
+          // way the emitted query cannot read unscoped rows.
+          this.walk(cte.stmt, ctes);
+          ctes.add(fold(name));
+        }
       }
     }
 
@@ -261,6 +310,20 @@ class Scoper {
       throw new TenantScopeError("unsupported FROM entry");
     }
 
+    // Unknown entry shape: reject rather than pass through silently.
+    for (const key of Object.keys(entry)) {
+      if (!FROM_ENTRY_KEYS.has(key)) {
+        throw new TenantScopeError(`unsupported FROM entry shape: "${key}"`);
+      }
+    }
+
+    // The parser's NATURAL/CROSS misparse lands the keyword in the alias slot.
+    if (typeof entry.as === "string" && JOIN_KEYWORDS.has(fold(entry.as))) {
+      throw new TenantScopeError(
+        `table alias "${entry.as}" is a join keyword (NATURAL/CROSS joins are not supported)`,
+      );
+    }
+
     // ON conditions may contain subqueries of their own.
     if (entry.on !== undefined) this.walk(entry.on, ctes);
 
@@ -274,13 +337,23 @@ class Scoper {
       throw new TenantScopeError("unsupported table reference");
     }
 
-    const key = fold(entry.table);
-    if (ctes.has(key)) {
-      // Reference to a CTE whose body has already been scoped.
+    // A schema-qualified name (`db.table`) can never resolve to a CTE in
+    // SQLite — only to a real table in that schema ("If a schema name is
+    // specified, then only that one schema is searched", lang_naming.html;
+    // verified: `WITH x AS (...) SELECT * FROM main.x` → "no such table").
+    // The schema describes a single database, so only `main` is accepted.
+    if (entry.db != null) {
+      if (typeof entry.db !== "string" || fold(entry.db) !== MAIN_DATABASE) {
+        throw new TenantScopeError(
+          `unsupported database qualifier "${String(entry.db)}" (only "${MAIN_DATABASE}" is allowed)`,
+        );
+      }
+    } else if (ctes.has(fold(entry.table))) {
+      // Unqualified reference to a CTE whose body has already been scoped.
       return entry;
     }
 
-    const info = this.index.get(key);
+    const info = this.index.get(fold(entry.table));
     if (info === undefined) {
       throw new TenantScopeError(`table "${entry.table}" is not in the schema`);
     }
@@ -310,6 +383,173 @@ class Scoper {
 }
 
 /**
+ * Post-condition, verified on every call: re-parse the emitted SQL and prove
+ * that every reference to a schema table is the sole FROM entry of a select
+ * whose shape is exactly `SELECT * FROM t WHERE t.<tenant col> = <tenant id>`.
+ * Parsing the output says nothing about tenancy; this check does. The scoper
+ * is trusted only as far as this verifier can confirm its output.
+ */
+class Verifier {
+  private readonly index: SchemaIndex;
+  private readonly tenantId: number;
+
+  constructor(index: SchemaIndex, tenantId: number) {
+    this.index = index;
+    this.tenantId = tenantId;
+  }
+
+  verify(sql: string): void {
+    const parser = new Parser();
+    let ast: unknown;
+    try {
+      ast = parser.astify(sql, PARSER_OPTIONS);
+    } catch {
+      throw new TenantScopeError("post-condition failed: emitted SQL does not re-parse");
+    }
+    if (Array.isArray(ast) || !isSelect(ast)) {
+      throw new TenantScopeError("post-condition failed: emitted SQL is not a single SELECT");
+    }
+    this.verifySelect(ast, new Set());
+  }
+
+  private fail(reason: string): never {
+    throw new TenantScopeError(`post-condition failed: ${reason}`);
+  }
+
+  private verifySelect(node: SelectNode, outerCtes: ReadonlySet<string>): void {
+    // Mirror the scoper's name-resolution model exactly (recursive-aware CTE
+    // ordering, qualified names never CTEs, scope inheritance into subqueries
+    // and set-op branches) — but as a checker, not a mutator.
+    const ctes = new Set(outerCtes);
+    if (Array.isArray(node.with)) {
+      for (const cte of node.with) {
+        const name = cte?.name?.value;
+        if (typeof name !== "string") this.fail("unsupported CTE shape");
+        if (cte.recursive === true) ctes.add(fold(name));
+        this.verifyNode(cte.stmt, ctes);
+        if (cte.recursive !== true) ctes.add(fold(name));
+      }
+    }
+
+    if (Array.isArray(node.from)) {
+      for (const entry of node.from) this.verifyFromEntry(entry, node, ctes);
+    } else if (node.from != null) {
+      this.fail("unsupported FROM clause shape");
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "with" || key === "from" || key === "_next") continue;
+      this.verifyNode(value, ctes);
+    }
+
+    if (node._next != null) {
+      if (!isSelect(node._next)) this.fail("unsupported set operation branch");
+      this.verifySelect(node._next, ctes);
+    }
+  }
+
+  private verifyFromEntry(entry: FromEntry, parent: SelectNode, ctes: ReadonlySet<string>): void {
+    if (typeof entry !== "object" || entry === null) this.fail("unsupported FROM entry");
+    for (const key of Object.keys(entry)) {
+      if (!FROM_ENTRY_KEYS.has(key)) this.fail(`unsupported FROM entry shape: "${key}"`);
+    }
+    if (typeof entry.as === "string" && JOIN_KEYWORDS.has(fold(entry.as))) {
+      this.fail(`join-keyword alias "${entry.as}"`);
+    }
+
+    if (entry.on !== undefined) this.verifyNode(entry.on, ctes);
+
+    // Derived table or table-valued function: verify whatever is inside.
+    if (entry.expr !== undefined) {
+      this.verifyNode(entry.expr, ctes);
+      return;
+    }
+
+    if (typeof entry.table !== "string") this.fail("unsupported table reference");
+
+    if (entry.db != null) {
+      if (typeof entry.db !== "string" || fold(entry.db) !== MAIN_DATABASE) {
+        this.fail(`unsupported database qualifier "${String(entry.db)}"`);
+      }
+    } else if (ctes.has(fold(entry.table))) {
+      return; // CTE reference; its body was verified at definition.
+    }
+
+    const info = this.index.get(fold(entry.table));
+    if (info === undefined) this.fail(`table "${entry.table}" is not in the schema`);
+
+    // A base-table reference is only acceptable as the sole FROM entry of the
+    // exact wrapper the scoper emits.
+    if (!this.isWrapperSelect(parent, info)) {
+      this.fail(`table "${info.name}" is referenced without tenant scoping`);
+    }
+  }
+
+  /**
+   * The wrapper shape: `SELECT * FROM <t> WHERE <t>.<tenant col> = <tenant id>`
+   * with no WITH, set-ops, DISTINCT, GROUP BY, HAVING, ORDER BY, or LIMIT.
+   */
+  private isWrapperSelect(node: SelectNode, info: TableInfo): boolean {
+    if (!Array.isArray(node.from) || node.from.length !== 1) return false;
+    const sole = node.from[0];
+    if (sole.expr !== undefined || typeof sole.table !== "string") return false;
+    if (sole.as != null) return false;
+    if (fold(sole.table) !== fold(info.name)) return false;
+    if (sole.db != null && fold(sole.db) !== MAIN_DATABASE) return false;
+
+    const empty = (v: unknown): boolean => v == null || (Array.isArray(v) && v.length === 0);
+    if (!empty(node.with) || node._next != null) return false;
+    for (const key of ["options", "distinct", "groupby", "having", "orderby", "limit", "for_update"]) {
+      if (!empty(node[key])) return false;
+    }
+
+    if (!Array.isArray(node.columns) || node.columns.length !== 1) return false;
+    const column = node.columns[0] as AstNode;
+    const columnExpr = column.expr as AstNode | undefined;
+    if (columnExpr?.type !== "column_ref" || columnExpr.column !== "*") return false;
+    if ((column.as ?? null) !== null) return false;
+
+    const where = node.where as AstNode | null | undefined;
+    if (where == null || where.type !== "binary_expr" || where.operator !== "=") return false;
+    const left = where.left as AstNode | undefined;
+    const right = where.right as AstNode | undefined;
+    if (left?.type !== "column_ref") return false;
+    if (fold(String(left.column ?? "")) !== fold(info.tenantColumn)) return false;
+    if (left.table != null && fold(String(left.table)) !== fold(info.name)) return false;
+    if (right?.type !== "number" || right.value !== this.tenantId) return false;
+    return true;
+  }
+
+  /** Generic descent mirroring Scoper.walk. */
+  private verifyNode(value: unknown, ctes: ReadonlySet<string>): void {
+    if (Array.isArray(value)) {
+      for (const item of value) this.verifyNode(item, ctes);
+      return;
+    }
+    if (typeof value !== "object" || value === null) return;
+    if (isSelect(value)) {
+      this.verifySelect(value, ctes);
+      return;
+    }
+    for (const child of Object.values(value)) this.verifyNode(child, ctes);
+  }
+}
+
+/**
+ * Standalone form of the post-condition main() runs on its output, exported
+ * for tests. Throws TenantScopeError unless every schema-table reference in
+ * `sql` sits under the exact tenant-filtered wrapper.
+ */
+export function assertFullyScoped(
+  sql: string,
+  schema: Schema,
+  tenantId: number,
+  tenantColumn: string,
+): void {
+  new Verifier(indexSchema(schema, tenantColumn), tenantId).verify(sql);
+}
+
+/**
  * Rewrite `query` so that every table it reads is restricted to rows whose
  * `tenantColumn` equals `tenantId`. Throws TenantScopeError on any input that
  * cannot be scoped with certainty.
@@ -330,12 +570,8 @@ export function main(
   const parser = new Parser();
   const sql = parser.sqlify(ast as unknown as NodeSqlParser.AST, PARSER_OPTIONS);
 
-  // Defensive round-trip: the rewritten AST must serialize to parseable SQL.
-  try {
-    parser.astify(sql, PARSER_OPTIONS);
-  } catch {
-    throw new TenantScopeError("internal error: scoped query failed to re-parse");
-  }
+  // Post-condition on every call: the scoper's output must prove itself.
+  new Verifier(index, tenantId).verify(sql);
 
   return sql;
 }
