@@ -2,7 +2,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 
-import { main, schema, TenantScopeError } from "./main.ts";
+import { main, schema, TenantScopeError, assertFullyScoped } from "./main.ts";
 
 const TENANT_ID = 1;
 const TENANT_COLUMN = "organization_id";
@@ -403,5 +403,139 @@ describe("output", () => {
     const sql = main(schema, "SELECT * FROM users", 42, TENANT_COLUMN);
     assert.match(sql, /"organization_id" = 42\b/);
     assert.doesNotMatch(sql, /'42'/);
+  });
+});
+
+describe("name resolution and hardening", () => {
+  const rejects = (query: string, pattern: RegExp) => {
+    assert.throws(
+      () => main(schema, query, TENANT_ID, TENANT_COLUMN),
+      (e: unknown) => {
+        assert.ok(e instanceof TenantScopeError, `expected TenantScopeError, got ${String(e)}`);
+        assert.match(e.message, pattern);
+        return true;
+      },
+    );
+  };
+
+  test("CTE shadowing a table via a qualified name still scopes the base table", () => {
+    const db = seedDatabase();
+    const rows = assertScopedEquals(
+      db,
+      "WITH users AS (SELECT * FROM main.users) SELECT COUNT(*) AS n FROM users",
+      "SELECT COUNT(*) AS n FROM users WHERE organization_id = 1",
+    );
+    assert.deepEqual(rows, [{ n: 2 }]);
+  });
+
+  test("unqualified CTE self-shadow emits scoped SQL that SQLite rejects as circular", () => {
+    const db = seedDatabase();
+    const sql = main(schema, "WITH users AS (SELECT * FROM users) SELECT * FROM users", TENANT_ID, TENANT_COLUMN);
+    assert.match(sql, /"organization_id" = 1/);
+    assert.throws(() => run(db, sql), /circular reference/);
+  });
+
+  test("recursive CTE that does not touch schema tables is passed through", () => {
+    const db = seedDatabase();
+    const rows = assertScopedEquals(
+      db,
+      "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT COUNT(*) AS n FROM c, users",
+      "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT COUNT(*) AS n FROM c, users WHERE users.organization_id = 1",
+    );
+    assert.deepEqual(rows, [{ n: 6 }]);
+  });
+
+  test("CTE scope does not leak into a sibling subquery", () => {
+    const db = seedDatabase();
+    assertScopedEquals(
+      db,
+      "SELECT (SELECT COUNT(*) FROM (WITH users AS (SELECT * FROM projects) SELECT * FROM users)) AS p, (SELECT COUNT(*) FROM users) AS u",
+      "SELECT (SELECT COUNT(*) FROM projects WHERE organization_id = 1) AS p, (SELECT COUNT(*) FROM users WHERE organization_id = 1) AS u",
+    );
+  });
+
+  test("JOIN ... USING is preserved", () => {
+    const db = seedDatabase();
+    const sql = main(schema, "SELECT COUNT(*) AS n FROM users JOIN projects USING (organization_id)", TENANT_ID, TENANT_COLUMN);
+    assert.match(sql, /USING \(organization_id\)/);
+    // Tenant 1 has two users and one project sharing organization_id.
+    assert.deepEqual(run(db, sql), [{ n: 2 }]);
+  });
+
+  test("qualified main.* names are scoped; other qualifiers are rejected", () => {
+    const db = seedDatabase();
+    assertScopedEquals(
+      db,
+      "SELECT COUNT(*) AS n FROM Main.Users u JOIN main.projects p ON p.owner_id = u.id",
+      "SELECT COUNT(*) AS n FROM users u JOIN projects p ON p.owner_id = u.id WHERE u.organization_id = 1 AND p.organization_id = 1",
+    );
+    rejects("SELECT * FROM temp.users", /database qualifier/);
+    rejects("SELECT * FROM other.users", /database qualifier/);
+  });
+
+  test("NATURAL and CROSS joins are rejected (parser misparse)", () => {
+    rejects("SELECT * FROM users NATURAL JOIN projects", /join keyword/);
+    rejects("SELECT * FROM users CROSS JOIN projects", /join keyword/);
+    rejects("SELECT * FROM users AS cross", /join keyword/);
+  });
+
+  test("table-valued functions in FROM are rejected", () => {
+    rejects("SELECT * FROM pragma_table_info('users')", /table-valued/);
+    rejects("SELECT * FROM users, json_each('[1]')", /table-valued/);
+    rejects("SELECT * FROM users WHERE id IN (SELECT value FROM json_each('[10]'))", /table-valued/);
+  });
+
+  test("schema identifiers must be plain", () => {
+    const badTable = [{ name: 'users" --', columns: [{ name: "organization_id", type: "integer" as const }] }];
+    assert.throws(() => main(badTable, "SELECT * FROM users", 1, TENANT_COLUMN), /not a plain identifier/);
+    const badColumn = [{ name: "users", columns: [{ name: 'organization_id" OR 1=1 OR "', type: "integer" as const }] }];
+    assert.throws(() => main(badColumn, "SELECT * FROM users", 1, 'organization_id" OR 1=1 OR "'), /not a plain identifier/);
+  });
+
+  test("tenant id edge values are emitted as literals", () => {
+    for (const id of [0, -5, Number.MAX_SAFE_INTEGER]) {
+      const sql = main(schema, "SELECT * FROM users", id, TENANT_COLUMN);
+      assert.match(sql, new RegExp(`"organization_id" = ${id}(?![0-9])`));
+    }
+  });
+
+  test("deep nesting fails closed with a typed error", () => {
+    const depth = 5000;
+    const q = "SELECT * FROM " + "(SELECT * FROM ".repeat(depth) + "users" + ")".repeat(depth);
+    assert.throws(() => main(schema, q, TENANT_ID, TENANT_COLUMN), TenantScopeError);
+  });
+});
+
+describe("post-condition verifier", () => {
+  const W = (where: string, alias = "users") =>
+    `SELECT * FROM (SELECT * FROM "users" WHERE ${where}) AS "${alias}"`;
+
+  test("accepts the exact wrapper shape, including bigint tenant ids", () => {
+    assertFullyScoped(W('"users"."organization_id" = 1'), schema, 1, TENANT_COLUMN);
+    assertFullyScoped(W('"users"."organization_id" = 1', "u"), schema, 1, TENANT_COLUMN);
+    const big = Number.MAX_SAFE_INTEGER;
+    assertFullyScoped(W(`"users"."organization_id" = ${big}`), schema, big, TENANT_COLUMN);
+  });
+
+  test("rejects unscoped or mis-scoped SQL", () => {
+    const bad = [
+      'SELECT * FROM "users"',
+      W('"users"."organization_id" = 2'),
+      W('"users"."organization_id" = 1 OR 1 = 1'),
+      W('"email" = 1'),
+      'SELECT * FROM (SELECT * FROM "users" WHERE "users"."organization_id" = 1) AS "u", "projects"',
+      'SELECT * FROM (SELECT * FROM "users" WHERE "users"."organization_id" = 1 UNION ALL SELECT * FROM "users") AS "u"',
+      'SELECT * FROM (SELECT *, 1 FROM "users" WHERE "users"."organization_id" = 1) AS "u"',
+      'SELECT * FROM (SELECT * FROM "users" u2 WHERE "u2"."organization_id" = 1) AS "u"',
+      'SELECT * FROM (SELECT * FROM "users" WHERE "users"."organization_id" = 1) AS "u" WHERE "id" IN (SELECT "id" FROM "projects")',
+      'SELECT * FROM json_each(\'[1]\')',
+    ];
+    for (const sql of bad) {
+      assert.throws(
+        () => assertFullyScoped(sql, schema, 1, TENANT_COLUMN),
+        (e: unknown) => e instanceof TenantScopeError && /post-condition/.test((e as Error).message),
+        `verifier accepted: ${sql}`,
+      );
+    }
   });
 });

@@ -126,6 +126,19 @@ const FROM_ENTRY_KEYS = new Set(["db", "table", "as", "join", "on", "using", "ex
 /** The only database qualifier the single-database schema can vouch for. */
 const MAIN_DATABASE = "main";
 
+/**
+ * Names that reach the emitted SQL (table names, the tenant column) must be
+ * plain identifiers. Anything else could break out of the double quotes
+ * sqlify wraps them in.
+ */
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** True when a FROM entry's `expr` is a subquery (possibly wrapped by the parser). */
+function isSubqueryExpr(expr: unknown): boolean {
+  if (isSelect(expr)) return true;
+  return typeof expr === "object" && expr !== null && isSelect((expr as AstNode).ast);
+}
+
 function isSelect(node: unknown): node is SelectNode {
   return (
     typeof node === "object" &&
@@ -164,8 +177,10 @@ function indexSchema(schema: Schema, tenantColumn: string): SchemaIndex {
   const wanted = fold(tenantColumn);
 
   for (const table of schema) {
-    if (typeof table?.name !== "string" || table.name.length === 0) {
-      throw new TenantScopeError("every schema table must have a name");
+    if (typeof table?.name !== "string" || !IDENTIFIER.test(table.name)) {
+      throw new TenantScopeError(
+        `schema table name ${JSON.stringify(table?.name)} is not a plain identifier`,
+      );
     }
     if (!Array.isArray(table.columns)) {
       throw new TenantScopeError(`schema table "${table.name}" has no columns`);
@@ -175,6 +190,11 @@ function indexSchema(schema: Schema, tenantColumn: string): SchemaIndex {
       throw new TenantScopeError(`schema declares table "${table.name}" twice`);
     }
     const match = table.columns.find((c) => fold(c?.name ?? "") === wanted);
+    if (match !== undefined && !IDENTIFIER.test(match.name)) {
+      throw new TenantScopeError(
+        `tenant column ${JSON.stringify(match.name)} on "${table.name}" is not a plain identifier`,
+      );
+    }
     index.set(key, {
       name: table.name,
       tenantColumn: match?.name ?? "",
@@ -328,7 +348,14 @@ class Scoper {
     if (entry.on !== undefined) this.walk(entry.on, ctes);
 
     // Derived table: `FROM (SELECT ...) AS x` — scope the inner query.
+    // Anything else in the expr slot (table-valued functions, virtual
+    // tables) reads data the schema cannot vouch for: reject.
     if (entry.expr !== undefined) {
+      if (!isSubqueryExpr(entry.expr)) {
+        throw new TenantScopeError(
+          "only tables and subqueries are allowed in FROM (table-valued functions are not supported)",
+        );
+      }
       this.walk(entry.expr, ctes);
       return entry;
     }
@@ -459,8 +486,10 @@ class Verifier {
 
     if (entry.on !== undefined) this.verifyNode(entry.on, ctes);
 
-    // Derived table or table-valued function: verify whatever is inside.
+    // Derived table: verify whatever is inside. Non-subquery expressions
+    // (table-valued functions) are never acceptable in scoped output.
     if (entry.expr !== undefined) {
+      if (!isSubqueryExpr(entry.expr)) this.fail("non-subquery FROM expression");
       this.verifyNode(entry.expr, ctes);
       return;
     }
@@ -516,8 +545,10 @@ class Verifier {
     if (left?.type !== "column_ref") return false;
     if (fold(String(left.column ?? "")) !== fold(info.tenantColumn)) return false;
     if (left.table != null && fold(String(left.table)) !== fold(info.name)) return false;
-    if (right?.type !== "number" || right.value !== this.tenantId) return false;
-    return true;
+    // The parser re-reads large literals as `bigint` with a string value.
+    if (right?.type === "number") return right.value === this.tenantId;
+    if (right?.type === "bigint") return right.value === String(this.tenantId);
+    return false;
   }
 
   /** Generic descent mirroring Scoper.walk. */

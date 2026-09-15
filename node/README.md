@@ -38,6 +38,9 @@ never see a row from another tenant, and outer-join semantics are preserved.
   NATURAL/CROSS misparse
 - a FROM entry with an unrecognized shape (unknown keys are rejected, not
   passed through)
+- a table-valued function or any non-subquery expression in FROM (the schema
+  cannot vouch for what it reads)
+- a schema table name or tenant column that is not a plain identifier
 
 ## TODO
 
